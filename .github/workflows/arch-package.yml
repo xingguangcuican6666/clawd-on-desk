@@ -89,7 +89,8 @@ jobs:
               # them so the lockfile is installed exactly as written.
               unset npm_config_registry npm_config_userconfig npm_config_globalconfig \
                     NPM_CONFIG_REGISTRY NPM_CONFIG_USERCONFIG NPM_CONFIG_GLOBALCONFIG
-              npm_config_allow_remote=1 npm_config_registry=https://registry.npmjs.org/ npm ci
+              # allow-remote takes all|none|root (not a boolean).
+              npm_config_allow_remote=all npm ci
               npm run verify:electron
               npx electron-builder --linux dir --x64 --publish never
               test -x dist/linux-unpacked/clawd-on-desk
