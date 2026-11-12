@@ -36,7 +36,7 @@ if [[ -f LICENSE ]]; then cp -a LICENSE "$buildroot/LICENSE"; fi
 # makepkg cannot run as root, so build as an unprivileged user.
 id builder >/dev/null 2>&1 || useradd -m builder
 chown -R builder "$buildroot"
-su builder -c 'cd "$1" && makepkg --nodeps --noconfirm' -- "$buildroot" 2>&1 | tail -20
+su builder -c "cd '$buildroot' && makepkg --nodeps --noconfirm" 2>&1 | tail -20
 
 pkg="$(ls -1 "$buildroot"/*.pkg.tar.zst | head -1)"
 test -n "$pkg"
