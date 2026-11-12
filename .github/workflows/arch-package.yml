@@ -31,6 +31,8 @@ on:
     paths:
       - .github/workflows/arch-package.yml
       - scripts/make-arch-pkgbuild.sh
+      - ci/arch-build.sh
+      - ci/fetch-electron.js
       - package.json
       - package-lock.json
       - src/linux-wayland.js
@@ -76,70 +78,14 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p out
+          # The build logic lives in ci/arch-build.sh so the container payload
+          # is a plain file: nesting quoted bash inside a YAML block scalar is
+          # where the quoting bugs came from.
           docker run --rm \
             -e PKG_VERSION="$PKG_VERSION" \
             -v "$PWD:/work" \
             -w /work \
-            archlinux:latest bash -euo pipefail -c '
-              pacman -Syu --noconfirm --needed base-devel git nodejs npm python \
-                fakeroot binutils findutils zstd pacman-contrib unzip libarchive
-
-              # GitHub runners export npm_config_* overrides (a mirror registry
-              # and a lockfile policy that rejects "remote" tarballs); clear
-              # them so the lockfile is installed exactly as written.
-              unset npm_config_registry npm_config_userconfig npm_config_globalconfig \
-                    NPM_CONFIG_REGISTRY NPM_CONFIG_USERCONFIG NPM_CONFIG_GLOBALCONFIG
-              # allow-remote takes all|none|root (not a boolean).
-              # Electron's postinstall cannot verify (or download) inside this
-              # image, so scripts are skipped and the binary is fetched
-              # explicitly; the app's own integrity gate then validates it.
-              npm_config_allow_remote=all npm ci --ignore-scripts
-              echo "fetching Electron $(node -p "require('electron/package.json').version")"
-              node -e "
-                const path = require('path');
-                const fs = require('fs');
-                require('@electron/get').downloadArtifact({
-                  version: require('electron/package.json').version,
-                  artifactName: 'electron',
-                  platform: 'linux',
-                  arch: 'x64',
-                  cacheRoot: undefined,
-                }).then(async (zip) => {
-                  const dest = path.join(process.cwd(), 'node_modules', 'electron', 'dist');
-                  fs.mkdirSync(dest, { recursive: true });
-                  const { execFileSync } = require('child_process');
-                  execFileSync('bsdtar', ['-xf', zip, '-C', dest], { stdio: 'inherit' });
-                  fs.writeFileSync(path.join(process.cwd(), 'node_modules', 'electron', 'path.txt'), 'electron');
-                  console.log('electron dist ready:', zip);
-                }).catch((e) => { console.error('electron download failed:', e && e.message); process.exit(1); });
-              "
-              npm run verify:electron
-              npx electron-builder --linux dir --x64 --publish never
-              test -x dist/linux-unpacked/clawd-on-desk
-              test -f dist/linux-unpacked/resources/app.asar
-
-              # Package ownership comes from the Arch file database.
-              pacman -Fy --noconfirm >/dev/null 2>&1 || true
-
-              buildroot=/work/.arch-build
-              rm -rf "$buildroot"
-              mkdir -p "$buildroot"
-              bash scripts/make-arch-pkgbuild.sh dist/linux-unpacked "$PKG_VERSION" "$buildroot/PKGBUILD"
-              # The payload lives next to the PKGBUILD; makepkg reads it from $startdir.
-              cp -a dist/linux-unpacked "$buildroot/app"
-              cp -a assets/icon.png "$buildroot/icon.png"
-              cp -a NOTICE.md "$buildroot/NOTICE.md"
-              if [[ -f LICENSE ]]; then cp -a LICENSE "$buildroot/LICENSE"; fi
-
-              # makepkg refuses to run as root; build as an unprivileged user.
-              id builder >/dev/null 2>&1 || useradd -m builder
-              chown -R builder "$buildroot"
-              su builder -c "cd \"$buildroot\" && makepkg --nodeps --noconfirm" 2>&1 | tail -20
-
-              pkg="$(ls -1 "$buildroot"/*.pkg.tar.zst | head -1)"
-              test -n "$pkg"
-              cp -a "$pkg" /work/out/
-            '
+            archlinux:latest bash /work/ci/arch-build.sh
 
       - name: Verify the package
         shell: bash
