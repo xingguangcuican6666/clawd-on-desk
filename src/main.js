@@ -213,6 +213,7 @@ const {
   mergeSessionFocusEntry,
 } = require("./session-focus");
 const { focusCodexThreadTarget, focusDshDesktopTarget } = require("./session-focus-handoff");
+const { publishDshFocus } = require("./dsh-focus-stream");
 const { isSessionInProgress } = require("./state-session-snapshot");
 const { restoreSessionsFromRecoveryLeases } = require("./session-recovery-loader");
 const { createSessionHistoryRuntime } = require("./session-history-runtime");
@@ -2680,6 +2681,7 @@ const _stateCtx = {
     _settingsController.get("permissionAutomationMode") || "off",
   getKiroDesktopPendingSessionIds: () => agentRuntime?.getKiroDesktopPendingSessionIds() || new Set(),
   getCopilotTerminalWaitSessionIds: () => agentRuntime?.getCopilotTerminalWaitSessionIds() || new Set(),
+  hasPendingClaudeTurnAskReminder: (sessionId) => claudeTurnAskReminder.isPending(sessionId),
   onSessionDeleted: (sessionId) => {
     agentRuntime?.clearKiroDesktopSession(sessionId);
     agentRuntime?.clearCopilotTerminalWaitSession(sessionId);
@@ -2976,6 +2978,7 @@ function focusDashboardSession(sessionId, options = {}) {
       requestSource,
       url: focusTarget.url,
       focusLog,
+      publishDshFocus,
     });
     return true;
   }
