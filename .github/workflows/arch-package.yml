@@ -84,7 +84,12 @@ jobs:
               pacman -Syu --noconfirm --needed base-devel git nodejs npm python \
                 fakeroot binutils findutils zstd pacman-contrib unzip
 
-              npm ci
+              # GitHub runners export npm_config_* overrides (a mirror registry
+              # and a lockfile policy that rejects "remote" tarballs); clear
+              # them so the lockfile is installed exactly as written.
+              unset npm_config_registry npm_config_userconfig npm_config_globalconfig \
+                    NPM_CONFIG_REGISTRY NPM_CONFIG_USERCONFIG NPM_CONFIG_GLOBALCONFIG
+              npm_config_allow_remote=1 npm_config_registry=https://registry.npmjs.org/ npm ci
               npm run verify:electron
               npx electron-builder --linux dir --x64 --publish never
               test -x dist/linux-unpacked/clawd-on-desk
