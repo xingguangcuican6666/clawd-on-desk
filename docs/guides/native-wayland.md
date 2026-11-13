@@ -75,6 +75,29 @@ recognised through `j/clients` by pid and claimed once, and — only for titles
 Electron itself gives our windows (`Electron`, empty) — also get a
 constructor-title placement rule.
 
+## Surface chrome
+
+Hyprland decorates every toplevel it manages — this config's
+`general:border_size` is 1, `decoration:rounding` 18 and
+`decoration:shadow:range` 20 — regardless of the `xdg-decoration` client-side
+mode Chromium asks for. Around a padding-free pet or HUD that shows up as a
+hairline frame and a shadow halo. Every surface the shim classifies as floating
+(pet render/hit windows, session HUD, quota ring, update bubble, context-menu
+owner, non-focusable permission bubbles) therefore gets a rule of its own:
+
+```
+border_size = 0, rounding = 0, no_shadow = true
+```
+
+These are static layout effects, so the rule is re-defined immediately before
+every show — same lifecycle as the placement rule, and it is re-asserted by
+`reassertAllRules()` after a config reload. If a window is opted back out of
+floating placement the rule is switched off instead of left in effect.
+
+Ordinary framed windows (settings, dashboard, tutorial) deliberately do **not**
+get this rule: their decoration belongs to the compositor and the user's own
+config. `CLAWD_WAYLAND_BORDERLESS=0` disables the rule entirely for debugging.
+
 ## Known gaps
 
 - Click-through (above).

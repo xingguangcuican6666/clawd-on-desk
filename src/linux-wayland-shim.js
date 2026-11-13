@@ -52,6 +52,8 @@
 //      and a future compositor that honours it needs no app change.
 //   6. Focus: focus() additionally dispatches compositor focus on the
 //      window's address; blur() hands focus back to the previous window.
+//   7. Chrome: floating surfaces get a second rule (border_size 0, rounding 0,
+//      no_shadow) so the compositor draws no frame or halo around them.
 //
 // Marker titles: each adopted window gets a unique invisible title prefix
 // ("Clawd" + zero-width bits encoding pid+id). Hyprland matches window rules
@@ -68,6 +70,25 @@
 // native call, so the app runs as a plain native-Wayland client.
 
 const { MARKER_PREFIX, RULE_PREFIX, encodeMarker, markerRegex } = require("./linux-wayland");
+
+// Chromium creates its Wayland toplevels with the xdg-decoration client-side
+// mode, but a compositor may still decorate them: this Hyprland config draws a
+// 1px border (general:border_size 1), corner rounding (decoration:rounding 18)
+// and a 20px drop shadow (decoration:shadow:range 20) around every toplevel
+// unless a rule says otherwise. Around a padding-free pet or HUD that reads as
+// a hairline frame and a halo, so the app removes it on its own surfaces.
+//
+// `border_size`, `rounding` and `no_shadow` are real layout rule effects —
+// verified against this compositor (0.57.0), which accepts them and rejects an
+// unknown name with "unknown field". They are STATIC — applied at map time — so
+// the rule is defined immediately before every show, like the placement rule.
+//
+// Only the floating, padding-free surfaces get the rule (pet, HUD, quota ring,
+// update bubble, menu owner, permission bubbles). Ordinary framed windows —
+// settings, dashboard, tutorial — keep whatever the compositor and the user's
+// own config do; overriding those would make the app ignore desktop theming.
+// CLAWD_WAYLAND_BORDERLESS=0 disables the rule for debugging.
+const BORDERLESS_ENABLED = process.env.CLAWD_WAYLAND_BORDERLESS !== "0";
 
 // Sync sleep for the show-verification poll. Atomics.wait is allowed on the
 // Node/Electron main thread (unlike a browser main thread) and needs no
@@ -190,6 +211,7 @@ function installLinuxWaylandWindowShim(options = {}) {
 
   function placementRuleName(state) { return `${RULE_PREFIX}place-${state.markerId}`; }
   function clickRuleName(state) { return `${RULE_PREFIX}click-${state.markerId}`; }
+  function chromeRuleName(state) { return `${RULE_PREFIX}chrome-${state.markerId}`; }
   // The primary identity of each window is an invisible marker in its title.
   // Adoption sets that title synchronously (Electron suppresses the
   // constructor's initial SetTitle, so the marker is in place before the
@@ -249,6 +271,46 @@ function installLinuxWaylandWindowShim(options = {}) {
 
   function escapeRegExp(text) {
     return String(text).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
+  // The padding-free floating surfaces (pet, HUD, quota ring, update bubble,
+  // menu owner, permission bubbles) are all frameless: none of them should
+  // ever show a compositor border, rounded corner or shadow halo. Ordinary
+  // windows are left to the compositor's own decoration config.
+  //
+  // A window can change class at runtime (setFloatingPlacement(false) after a
+  // caller opts out), so the rule is also turned OFF in that case — otherwise
+  // the window would keep the decoration-free look it no longer asks for.
+  // `chromeRuleOn` tracks which of the two directions the last sync left it in
+  // so the enable/disable round trip happens once per transition, not once per
+  // show.
+  function syncChromeRule(state) {
+    if (!BORDERLESS_ENABLED) return;
+    const name = chromeRuleName(state);
+    if (!state.floating) {
+      if (!state.chromeRuleOn) return;
+      state.chromeRuleOn = false;
+      state.lastChromeKey = "";
+      for (const ruleName of definedRules.keys()) {
+        if (ruleName.startsWith(`${name}-`)) backend.setWindowRuleEnabled(ruleName, false);
+      }
+      return;
+    }
+    const effects = { border_size: 0, rounding: 0, no_shadow: true };
+    const key = JSON.stringify(effects);
+    if (key === state.lastChromeKey && state.chromeRuleOn) return;
+    const wasOn = state.chromeRuleOn;
+    state.lastChromeKey = key;
+    state.chromeRuleOn = true;
+    for (const pattern of rulePatterns(state)) {
+      const ruleName = `${name}-${hashPattern(pattern)}`;
+      definedRules.set(ruleName, { pattern, effects });
+      backend.defineWindowRule(ruleName, pattern, effects);
+      // A rule switched off by the non-floating path above is still a known
+      // rule in the compositor: re-defining it may not restore its enabled
+      // flag, so turn it back on explicitly.
+      if (!wasOn) backend.setWindowRuleEnabled(ruleName, true);
+    }
   }
 
   function syncPlacementRule(state) {
@@ -311,6 +373,8 @@ function installLinuxWaylandWindowShim(options = {}) {
       wantsFocusOnMap: false,
       clickThrough: null,
       lastPlacementKey: "",
+      lastChromeKey: "",
+      chromeRuleOn: false,
       patternsDirty: false,
       constructorTitle: "",
       titleGuarded: false,
@@ -351,6 +415,9 @@ function installLinuxWaylandWindowShim(options = {}) {
     if (visible) {
       try { native.hide.call(win); } catch {}
       sleepSync(60);
+      // The re-show below is a real remap, so the static rules must already
+      // be defined for it: the show path's own syncs are not reached here.
+      syncChromeRule(state);
       if (state.floating) syncPlacementRule(state);
       runShowAttempt(win, state, false);
     }
@@ -404,6 +471,7 @@ function installLinuxWaylandWindowShim(options = {}) {
   // verify → retry.
   function showWithVerification(win, state, activating) {
     assertMarkerTitle(win, state);
+    syncChromeRule(state);
     if (!state.floating) {
       // Ordinary window: no static rule to assert; still verify the map so a
       // dropped remap gets retried instead of leaving an invisible window
@@ -727,6 +795,10 @@ function installLinuxWaylandWindowShim(options = {}) {
       classify(win, state);
       state.lastPlacementKey = "";
       syncPlacementRule(state);
+      // No key reset here: syncChromeRule() compares the current effect key
+      // itself, and an opt-OUT has to see the previous key to know the rule is
+      // currently on.
+      syncChromeRule(state);
       return true;
     },
     // Place an already-mapped window right now. Static rule effects only apply
@@ -752,7 +824,9 @@ function installLinuxWaylandWindowShim(options = {}) {
         }
       }
       state.lastPlacementKey = "";
+      state.lastChromeKey = "";
       syncPlacementRule(state);
+      syncChromeRule(state);
       if (!state.address) refreshAddress(state);
       if (state.logical && state.address) {
         backend.moveWindow(state.address, state.logical.x, state.logical.y);

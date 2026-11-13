@@ -367,6 +367,83 @@ describe("placement rules (floating surfaces)", () => {
   });
 });
 
+describe("borderless rule (compositor-drawn chrome)", () => {
+  it("a floating (focusable:false) surface gets a border_size/rounding/no_shadow rule", () => {
+    const w = new BaseWindow({ show: false, focusable: false, x: 5, y: 5, width: 60, height: 60 });
+    w.getBounds();
+    w.showInactive();
+    const chrome = [...compositor.rules.entries()].filter(([n]) => n.includes("chrome-"));
+    assert.ok(chrome.length > 0, "chrome rule must exist");
+    for (const [, rule] of chrome) {
+      assert.equal(rule.effects.border_size, 0);
+      assert.equal(rule.effects.rounding, 0);
+      assert.equal(rule.effects.no_shadow, true);
+      assert.ok(rule.pattern.startsWith("^Clawd"));
+    }
+  });
+
+  it("an ordinary framed window is left to the compositor's own decoration config", () => {
+    const w = new BaseWindow({ show: false, focusable: true });
+    w.getBounds();
+    w.show();
+    const chrome = [...compositor.rules.keys()].filter((n) => n.includes("chrome-"));
+    assert.deepEqual(chrome, []);
+  });
+
+  it("an explicitly floating focusable window (menu owner) also gets the rule", () => {
+    const w = new BaseWindow({ show: false, focusable: true });
+    shim.setFloatingPlacement(w, true);
+    w.getBounds();
+    w.showInactive();
+    const chrome = [...compositor.rules.keys()].filter((n) => n.includes("chrome-"));
+    assert.ok(chrome.length > 0);
+  });
+
+  it("CLAWD_WAYLAND_BORDERLESS=0 disables the rule", () => {
+    const previous = process.env.CLAWD_WAYLAND_BORDERLESS;
+    process.env.CLAWD_WAYLAND_BORDERLESS = "0";
+    try {
+      install();
+      const w = new BaseWindow({ show: false, focusable: false });
+      w.getBounds();
+      w.showInactive();
+      const chrome = [...compositor.rules.keys()].filter((n) => n.includes("chrome-"));
+      assert.deepEqual(chrome, []);
+    } finally {
+      if (previous === undefined) delete process.env.CLAWD_WAYLAND_BORDERLESS;
+      else process.env.CLAWD_WAYLAND_BORDERLESS = previous;
+    }
+  });
+
+  it("opting a window back out of floating placement disables the rule", () => {
+    const w = new BaseWindow({ show: false, focusable: false });
+    w.getBounds();
+    w.showInactive();
+    const names = [...compositor.rules.keys()].filter((n) => n.includes("chrome-"));
+    assert.ok(names.length > 0);
+    shim.setFloatingPlacement(w, false);
+    for (const name of names) {
+      assert.equal(compositor.rules.get(name).enabled, false);
+    }
+    // ...and opting back in re-enables it.
+    shim.setFloatingPlacement(w, true);
+    for (const name of names) {
+      assert.equal(compositor.rules.get(name).enabled, true);
+    }
+  });
+
+  it("reassertAllRules re-defines it after a config reload", () => {
+    const w = new BaseWindow({ show: false, focusable: false });
+    w.getBounds();
+    w.showInactive();
+    const names = [...compositor.rules.keys()].filter((n) => n.includes("chrome-"));
+    assert.ok(names.length > 0);
+    compositor.rules.clear();
+    shim.reassertAllRules();
+    for (const name of names) assert.ok(compositor.rules.has(name));
+  });
+});
+
 describe("click-through (setIgnoreMouseEvents → no_focus rule)", () => {
   it("toggles a dedicated no_focus rule instead of calling the native no-op", () => {
     const w = new BaseWindow({ show: false, focusable: false });
