@@ -24,6 +24,7 @@ docs/**
 !docs/guides/known-limitations.md
 !docs/guides/agent-questions.md
 !docs/guides/known-limitations.zh-CN.md
+!docs/guides/native-wayland.md
 !docs/guides/recap.md
 !docs/guides/setup-guide.md
 !docs/guides/slack-notifications.md
@@ -140,6 +141,8 @@ scripts/apt/__pycache__/
 !scripts/generate-mac-tray-icons.js
 !scripts/generate-readme-contributors.js
 !scripts/update-official-theme-catalog-snapshot.js
+# Arch (pacman) PKGBUILD generator — used by .github/workflows/arch-package.yml
+!scripts/make-arch-pkgbuild.sh
 !scripts/manual/
 scripts/manual/*
 !scripts/manual/README.md
