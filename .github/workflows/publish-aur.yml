@@ -1,0 +1,288 @@
+# Publish the Arch package (AUR) for Clawd on Desk.
+#
+# The package lives in packaging/aur/clawd-on-desk-bin and repackages the
+# official release AppImage. This workflow is the only thing that pushes it to
+# the AUR: it resolves a released tag, downloads that release's assets,
+# recomputes every checksum from the bytes it actually downloaded, rewrites the
+# PKGBUILD's pkgver/pkgrel/sha256sums, verifies the package builds and installs,
+# and only then pushes to the AUR git remote.
+#
+# Nothing is pushed unless every gate passes. A version bump that ships a
+# PKGBUILD whose checksum does not match the published asset is the failure this
+# workflow exists to prevent, so no checksum is ever taken from a constant in
+# the repository — each one is measured here.
+name: Publish AUR package
+
+on:
+  release:
+    types: [released]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish, e.g. v1.6.0"
+        required: true
+        type: string
+      publish:
+        description: "Push to the AUR after the build passes"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aur-publish
+  cancel-in-progress: false
+
+env:
+  # The package tracks the official project, not whichever fork this workflow
+  # happens to run in, so the release is fetched from there by name.
+  UPSTREAM_REPO: rullerzhou-afk/clawd-on-desk
+  AUR_HOST: git.aur-a.meowarch.top
+  AUR_PORT: "22222"
+  AUR_USER: aur
+  AUR_PACKAGE: clawd-on-desk-bin
+  # Pinned rather than trusted on first use: the runner has no known_hosts entry
+  # for this host, and StrictHostKeyChecking=no would accept a substituted key
+  # for a push that carries the account's credentials.
+  # ssh-keygen -lf of the live host key:
+  #   256 SHA256:sjMPByoE5xbZlc7bABqvJhi2xVvO1EKrcZDZBvofT38 (ED25519)
+  AUR_HOST_KEY: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPClmUO/ZU8+0TghZYhtpjXxGvxEqbLVbfY2TH6gwuHM"
+
+jobs:
+  # Cheap gate: only a real release tag may proceed, and it must not be a
+  # prerelease. `released` never fires for drafts or prereleases, but a
+  # prerelease edited into a release does fire it, and workflow_dispatch can
+  # name any tag at all.
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
+      publish: ${{ steps.tag.outputs.publish }}
+    steps:
+      - name: Resolve the release tag
+        id: tag
+        shell: bash
+        env:
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          EVENT_PRERELEASE: ${{ github.event.release.prerelease }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_PUBLISH: ${{ inputs.publish }}
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG:-$EVENT_TAG}"
+          if [[ -z "$tag" ]]; then
+            echo "::error::no tag supplied"; exit 1
+          fi
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::tag '$tag' is not a vX.Y.Z release tag"; exit 1
+          fi
+          if [[ "$EVENT_PRERELEASE" == "true" ]]; then
+            echo "::error::'$tag' is a prerelease; the AUR package tracks releases only"; exit 1
+          fi
+          # pacman versions may not contain '-' or '+'.
+          version="${tag#v}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # A published release publishes automatically; a manual run must ask.
+          if [[ "$GITHUB_EVENT_NAME" == "release" || "$INPUT_PUBLISH" == "true" ]]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Resolved $tag (version $version)"
+
+  build:
+    needs: resolve
+    # Arch is required, not merely convenient: makepkg, pacman and the Arch
+    # library set are what the package is built and installed against. The
+    # ubuntu-latest runner only hosts the container.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download the release assets and measure their checksums
+        shell: bash
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p aur-input
+          base="https://github.com/$UPSTREAM_REPO/releases/download/${TAG}"
+          raw="https://raw.githubusercontent.com/$UPSTREAM_REPO/${TAG}"
+          appimage="Clawd-on-Desk-${VERSION}-x86_64.AppImage"
+          # The AppImage is ~135 MB. A stall here is a network failure, not a
+          # packaging one, so curl retries and then fails rather than leaving a
+          # truncated file for makepkg to checksum.
+          curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors \
+            -o "aur-input/$appimage" "$base/$appimage"
+          curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors \
+            -o aur-input/LICENSE "$raw/LICENSE"
+          curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors \
+            -o aur-input/NOTICE.md "$raw/NOTICE.md"
+          # `--appimage-offset` is answered by the runtime before any mount, so
+          # this proves the download is an AppImage and not an error page saved
+          # under the right filename.
+          chmod +x "aur-input/$appimage"
+          "aur-input/$appimage" --appimage-offset >/dev/null
+          ( cd aur-input && sha256sum "$appimage" LICENSE NOTICE.md > SHA256SUMS )
+          cat aur-input/SHA256SUMS
+
+      - name: Stage the PKGBUILD for this version
+        shell: bash
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Rewrite the version and the checksums only. The dependency list,
+          # install layout and packaging logic are reviewed in-tree; a release
+          # bump must not silently change them.
+          python3 - "$VERSION" aur-input/SHA256SUMS <<'PY'
+          import pathlib, re, sys
+          version, sums_path = sys.argv[1], sys.argv[2]
+          sums = [line.split()[0] for line in pathlib.Path(sums_path).read_text().splitlines() if line.strip()]
+          if len(sums) != 3:
+              sys.exit(f"expected 3 checksums in {sums_path}, found {len(sums)}")
+          path = pathlib.Path("packaging/aur/clawd-on-desk-bin/PKGBUILD")
+          text = path.read_text()
+          text, n_ver = re.subn(r"^pkgver=.*$", f"pkgver={version}", text, flags=re.M)
+          if n_ver != 1:
+              sys.exit("PKGBUILD must define pkgver exactly once")
+          # pkgrel resets to 1 for a new pkgver; a repackage of the same version
+          # bumps it by hand.
+          text, n_rel = re.subn(r"^pkgrel=.*$", "pkgrel=1", text, flags=re.M)
+          if n_rel != 1:
+              sys.exit("PKGBUILD must define pkgrel exactly once")
+          match = re.search(r"^sha256sums=\(\n(.*?)^\)$", text, flags=re.M | re.S)
+          if not match:
+              sys.exit("PKGBUILD must define a multi-line sha256sums array")
+          if len(re.findall(r"'[0-9a-f]{64}'", match.group(1))) != 3:
+              sys.exit("PKGBUILD sha256sums must hold exactly 3 entries")
+          body = "".join(f"    '{value}'\n" for value in sums)
+          text = text[:match.start()] + "sha256sums=(\n" + body + ")\n" + text[match.end():]
+          path.write_text(text)
+          PY
+          grep -nE "^(pkgver|pkgrel)=" packaging/aur/clawd-on-desk-bin/PKGBUILD
+          sed -n '/^sha256sums=(/,/^)/p' packaging/aur/clawd-on-desk-bin/PKGBUILD
+
+      - name: Build and verify the package in an Arch container
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The build logic is a plain file for the same reason ci/arch-build.sh
+          # is: nesting quoted bash inside a YAML block scalar is where the
+          # quoting bugs come from.
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work \
+            archlinux:latest bash /work/packaging/aur/ci/aur-build.sh
+
+      - name: Show the generated .SRCINFO
+        shell: bash
+        run: cat out/aur/SRCINFO
+
+      # .SRCINFO is deliberately uploaded as "SRCINFO": upload-artifact v4
+      # excludes hidden files by default, and a missing .SRCINFO would fail the
+      # AUR hook only after the push had already started.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aur-package-${{ needs.resolve.outputs.version }}
+          path: |
+            out/aur/*.pkg.tar.zst
+            out/aur/SRCINFO
+            out/aur/PKGBUILD
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    needs: [resolve, build]
+    if: needs.resolve.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # AUR publication is the outward-facing step: it is gated behind an
+    # environment so the signing key only exists inside an approved run.
+    environment: aur-publish
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: aur-package-${{ needs.resolve.outputs.version }}
+          path: out/aur
+
+      - name: Configure SSH for the AUR
+        shell: bash
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$AUR_SSH_PRIVATE_KEY" || { echo "::error::AUR_SSH_PRIVATE_KEY is not set"; exit 1; }
+          ssh_dir="$RUNNER_TEMP/aur-ssh"
+          install -d -m 700 "$ssh_dir"
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > "$ssh_dir/id"
+          chmod 600 "$ssh_dir/id"
+          # A non-default port is looked up as "[host]:port", not "host". A bare
+          # "host" entry is silently ignored and the connection then fails host
+          # verification against an empty known_hosts.
+          printf '[%s]:%s %s\n' "$AUR_HOST" "$AUR_PORT" "$AUR_HOST_KEY" > "$ssh_dir/known_hosts"
+          # Keyed on the real hostname, not an alias: git passes the URL's host
+          # to ssh, and an alias block would never match it.
+          cat > "$ssh_dir/config" <<SSHCONF
+          Host $AUR_HOST
+            HostName $AUR_HOST
+            Port $AUR_PORT
+            User $AUR_USER
+            IdentityFile $ssh_dir/id
+            IdentitiesOnly yes
+            BatchMode yes
+            StrictHostKeyChecking yes
+            UserKnownHostsFile $ssh_dir/known_hosts
+          SSHCONF
+          # GIT_SSH_COMMAND covers git; plain ssh calls pass -F explicitly.
+          echo "GIT_SSH_COMMAND=ssh -F $ssh_dir/config" >> "$GITHUB_ENV"
+          echo "AUR_SSH_CONFIG=$ssh_dir/config" >> "$GITHUB_ENV"
+
+      - name: Confirm the key authenticates as the package owner
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `list-repos` is the service's own command and only answers for an
+          # authenticated key, so a wrong or expired key fails here instead of
+          # after a push attempt.
+          if ! repos="$(ssh -F "$AUR_SSH_CONFIG" -T "$AUR_HOST" list-repos 2>&1)"; then
+            printf '%s\n' "$repos"
+            echo "::error::the AUR key was rejected"; exit 1
+          fi
+          printf '%s\n' "$repos"
+
+      - name: Push the package to the AUR
+        shell: bash
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/aur-repo"
+          remote="ssh://$AUR_USER@$AUR_HOST:$AUR_PORT/$AUR_PACKAGE"
+          # The package repo is created by the service on the first push of a
+          # valid PKGBUILD, so a failed clone is expected once and not fatal.
+          if ! git clone "$remote" "$work" 2>/dev/null; then
+            mkdir -p "$work"
+            git -C "$work" init -q -b master
+          fi
+          cp out/aur/PKGBUILD "$work/PKGBUILD"
+          cp out/aur/SRCINFO "$work/.SRCINFO"
+          git -C "$work" config user.name "Clawd release bot"
+          git -C "$work" config user.email "release-bot@users.noreply.github.com"
+          git -C "$work" add PKGBUILD .SRCINFO
+          if git -C "$work" diff --cached --quiet; then
+            echo "AUR is already at $VERSION-1; nothing to push"
+            exit 0
+          fi
+          git -C "$work" commit -q -m "upgpkg: $AUR_PACKAGE $VERSION-1"
+          # The service's hook rejects a commit whose .SRCINFO disagrees with its
+          # PKGBUILD, and rejects a non-fast-forward outright. Both are reported
+          # on the push itself, so its output is the final gate.
+          git -C "$work" push origin master

@@ -1,0 +1,161 @@
+# Maintainer: xingguangcuican <xingguangcuican666@foxmail.com>
+#
+# clawd-on-desk-bin — repackages the official release AppImage for Arch.
+#
+# The upstream project ships an Electron app; there is no Arch packaging
+# in-tree that an AUR user could build without a full electron-builder run
+# (a ~470 MB npm tree plus an Electron download). This package therefore
+# installs the payload the upstream AppImage already contains.
+#
+# Why the AppImage and not the .deb: the .deb carries a
+# resources/package-type marker of "deb", which makes the app's updater tell
+# the user to update through APT. The AppImage has no marker, so the app
+# resolves to its "manual" update path and points at the download page —
+# the truthful answer for a package pacman owns.
+#
+# What is installed: the AppDir payload in /opt/Clawd-on-Desk, a launcher in
+# /usr/bin, the desktop entry and hicolor icons. The AppImage runtime pieces
+# (AppRun, clawd-appimage-launcher.sh, the bundled Ubuntu libraries under
+# usr/lib) are deliberately dropped: they only exist to make a FUSE mount
+# work, and the binary's RPATH is $ORIGIN, so nothing loads them here.
+
+pkgname=clawd-on-desk-bin
+_pkgname=Clawd-on-Desk
+pkgver=1.6.0
+pkgrel=1
+pkgdesc='Clawd on Desk - a desktop pet that reacts to your coding sessions'
+arch=('x86_64')
+url='https://github.com/rullerzhou-afk/clawd-on-desk'
+_ghurl='https://github.com/rullerzhou-afk/clawd-on-desk'
+_rawurl='https://raw.githubusercontent.com/rullerzhou-afk/clawd-on-desk'
+license=('AGPL-3.0-only')
+# Resolved from the shipped binary: `readelf -d` supplies the linked sonames,
+# the libraries Chromium dlopen()s (GTK 3, NSS, X11, Wayland/Ozone, GBM, ALSA,
+# libnotify, libsecret, libpulse, Vulkan) are listed explicitly, and
+# `pacman -F` named the owning packages. Libraries that ship inside the
+# bundle (libEGL, libGLESv2, libffmpeg, libvk_swiftshader) are not requested
+# from the distro.
+depends=(
+    alsa-lib
+    at-spi2-core
+    cairo
+    dbus
+    expat
+    gcc-libs
+    glib2
+    glibc
+    gtk3
+    libcups
+    libdrm
+    libnotify
+    libpulse
+    libsecret
+    libx11
+    libxcb
+    libxcomposite
+    libxdamage
+    libxext
+    libxfixes
+    libxkbcommon
+    libxrandr
+    mesa
+    nspr
+    nss
+    pango
+    systemd-libs
+    # Electron dlopen()s libvulkan.so.1 for the GPU process; mesa does not
+    # pull the loader in, so it is listed rather than left to the ICD's own
+    # packaging.
+    vulkan-icd-loader
+    wayland
+    xdg-utils
+)
+optdepends=('libappindicator: system tray icon')
+provides=('clawd-on-desk')
+conflicts=('clawd-on-desk')
+# Electron binaries must not be stripped; !debug keeps a release build from
+# producing a debug package nobody can use.
+options=('!strip' '!debug')
+source=(
+    "${_pkgname}-${pkgver}-x86_64.AppImage::${_ghurl}/releases/download/v${pkgver}/${_pkgname}-${pkgver}-x86_64.AppImage"
+    "LICENSE::${_rawurl}/v${pkgver}/LICENSE"
+    "NOTICE.md::${_rawurl}/v${pkgver}/NOTICE.md"
+)
+# The AppImage is an ELF runtime wrapped around a squashfs; makepkg must not
+# try to unpack it, prepare() runs its own extractor.
+noextract=("${_pkgname}-${pkgver}-x86_64.AppImage")
+sha256sums=(
+    'd09d6efae228f3b6b57ecd0911d5c50db65875f072c9aa098280033f16290ff7'
+    '8486a10c4393cee1c25392769ddd3b2d6c242d6ec7928e1414efff7dfb2f07ef'
+    '62e3b7fd58f053b37c555e1c0d9e9372691707fee02e46beb99b84cad940bcee'
+)
+
+prepare() {
+    cd "$srcdir"
+
+    # --appimage-extract uses the runtime's built-in squashfs reader, so this
+    # works without FUSE and without mounting anything. It writes ./squashfs-root.
+    # The leading ./ matters: a bare filename would be looked up on PATH.
+    chmod +x "./${_pkgname}-${pkgver}-x86_64.AppImage"
+    "./${_pkgname}-${pkgver}-x86_64.AppImage" --appimage-extract >/dev/null
+    [[ -x squashfs-root/clawd-on-desk ]] || {
+        echo "error: the AppImage did not extract an executable payload" >&2
+        exit 1
+    }
+}
+
+package() {
+    local appdir="$srcdir/squashfs-root"
+
+    install -d "$pkgdir/opt/Clawd-on-Desk"
+    cp -a "$appdir/." "$pkgdir/opt/Clawd-on-Desk/"
+
+    # AppImage runtime only: the FUSE-mount supervisor, the AppRun wrapper, the
+    # AppDir's own desktop file and icon links, and the Ubuntu libraries the
+    # runtime put on LD_LIBRARY_PATH. None of them are reachable from /opt.
+    rm -rf \
+        "$pkgdir/opt/Clawd-on-Desk/AppRun" \
+        "$pkgdir/opt/Clawd-on-Desk/clawd-appimage-launcher.sh" \
+        "$pkgdir/opt/Clawd-on-Desk/clawd-on-desk.desktop" \
+        "$pkgdir/opt/Clawd-on-Desk/clawd-on-desk.png" \
+        "$pkgdir/opt/Clawd-on-Desk/.DirIcon" \
+        "$pkgdir/opt/Clawd-on-Desk/usr"
+
+    # Chromium's setuid sandbox helper must stay root-owned and setuid; pacman
+    # keeps the mode, so set both explicitly.
+    chown -R root:root "$pkgdir"
+    chmod 4755 "$pkgdir/opt/Clawd-on-Desk/chrome-sandbox"
+
+    install -d "$pkgdir/usr/bin"
+    ln -s /opt/Clawd-on-Desk/clawd-on-desk "$pkgdir/usr/bin/clawd-on-desk"
+
+    install -Dm644 "$appdir/usr/share/icons/hicolor/512x512/apps/clawd-on-desk.png" \
+        "$pkgdir/usr/share/icons/hicolor/512x512/apps/clawd-on-desk.png"
+    local size
+    for size in 16x16 32x32 48x48 64x64 128x128 256x256; do
+        [[ -f "$appdir/usr/share/icons/hicolor/$size/apps/clawd-on-desk.png" ]] || continue
+        install -Dm644 "$appdir/usr/share/icons/hicolor/$size/apps/clawd-on-desk.png" \
+            "$pkgdir/usr/share/icons/hicolor/$size/apps/clawd-on-desk.png"
+    done
+
+    # StartupWMClass matches the class the window actually gets (verified from
+    # the compositor), so the launcher and the pet window group together.
+    install -d "$pkgdir/usr/share/applications"
+    cat > "$pkgdir/usr/share/applications/clawd-on-desk.desktop" <<'DESKTOP'
+[Desktop Entry]
+Name=Clawd on Desk
+Comment=A desktop pet that reacts to your coding sessions
+Exec=/usr/bin/clawd-on-desk %U
+Icon=clawd-on-desk
+Terminal=false
+Type=Application
+Categories=Utility;
+StartupWMClass=clawd-on-desk
+MimeType=x-scheme-handler/clawd;
+DESKTOP
+
+    install -Dm644 "$srcdir/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 "$srcdir/NOTICE.md" "$pkgdir/usr/share/licenses/$pkgname/NOTICE.md"
+}
+
+# vim:set ft=sh:
