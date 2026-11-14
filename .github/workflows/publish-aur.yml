@@ -1,26 +1,39 @@
 # Publish the Arch package (AUR) for Clawd on Desk.
 #
-# The package lives in packaging/aur/clawd-on-desk-bin and repackages the
-# official release AppImage. This workflow is the only thing that pushes it to
-# the AUR: it resolves a released tag, downloads that release's assets,
-# recomputes every checksum from the bytes it actually downloaded, rewrites the
-# PKGBUILD's pkgver/pkgrel/sha256sums, verifies the package builds and installs,
-# and only then pushes to the AUR git remote.
+# Two packages live under packaging/aur:
+#   clawd-on-desk-bin  repackages the official release AppImage. Released
+#                      versions only; driven by the release event.
+#   clawd-on-desk-git  builds from source, tracking this fork's
+#                      feat/native-wayland-xingguangcuican6666 branch, which
+#                      carries the native Wayland backend. No release exists
+#                      for that code, so this one is driven by pushes to the
+#                      branch (plus a manual run).
 #
-# Nothing is pushed unless every gate passes. A version bump that ships a
-# PKGBUILD whose checksum does not match the published asset is the failure this
-# workflow exists to prevent, so no checksum is ever taken from a constant in
-# the repository — each one is measured here.
+# This workflow is the only thing that pushes either package to the AUR. Every
+# gate below runs before the push: a version bump that ships a PKGBUILD whose
+# checksum does not match the asset, or a .SRCINFO that disagrees with its
+# PKGBUILD, is exactly the failure this workflow exists to prevent.
 name: Publish AUR package
 
 on:
   release:
     types: [released]
+  push:
+    branches: [feat/native-wayland-xingguangcuican6666]
+    paths:
+      - packaging/aur/clawd-on-desk-git/**
+      - packaging/aur/ci/**
+      - .github/workflows/publish-aur.yml
   workflow_dispatch:
     inputs:
+      package:
+        description: "Which package to publish"
+        type: choice
+        options: [clawd-on-desk-git, clawd-on-desk-bin]
+        default: clawd-on-desk-git
       tag:
-        description: "Release tag to publish, e.g. v1.6.0"
-        required: true
+        description: "Release tag for clawd-on-desk-bin, e.g. v1.6.0 (ignored for -git)"
+        required: false
         type: string
       publish:
         description: "Push to the AUR after the build passes"
@@ -31,17 +44,18 @@ permissions:
   contents: read
 
 concurrency:
-  group: aur-publish
+  group: aur-publish-${{ github.ref }}
   cancel-in-progress: false
 
 env:
-  # The package tracks the official project, not whichever fork this workflow
-  # happens to run in, so the release is fetched from there by name.
+  # The -bin package tracks the official project, not whichever fork this
+  # workflow happens to run in, so its release is fetched from there by name.
+  # The -git package's source lives in its PKGBUILD, not here: a fork URL in
+  # this file would be a second place to keep in sync for no benefit.
   UPSTREAM_REPO: rullerzhou-afk/clawd-on-desk
   AUR_HOST: git.aur-a.meowarch.top
   AUR_PORT: "22222"
   AUR_USER: aur
-  AUR_PACKAGE: clawd-on-desk-bin
   # Pinned rather than trusted on first use: the runner has no known_hosts entry
   # for this host, and StrictHostKeyChecking=no would accept a substituted key
   # for a push that carries the account's credentials.
@@ -50,48 +64,71 @@ env:
   AUR_HOST_KEY: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPClmUO/ZU8+0TghZYhtpjXxGvxEqbLVbfY2TH6gwuHM"
 
 jobs:
-  # Cheap gate: only a real release tag may proceed, and it must not be a
-  # prerelease. `released` never fires for drafts or prereleases, but a
-  # prerelease edited into a release does fire it, and workflow_dispatch can
-  # name any tag at all.
+  # Cheap gate: decide which package this run is about and whether it may
+  # publish at all. A release event is always -bin; a branch push is always
+  # -git; a manual run names one.
   resolve:
     runs-on: ubuntu-latest
     outputs:
-      tag: ${{ steps.tag.outputs.tag }}
-      version: ${{ steps.tag.outputs.version }}
-      publish: ${{ steps.tag.outputs.publish }}
+      package: ${{ steps.plan.outputs.package }}
+      tag: ${{ steps.plan.outputs.tag }}
+      version: ${{ steps.plan.outputs.version }}
+      publish: ${{ steps.plan.outputs.publish }}
     steps:
-      - name: Resolve the release tag
-        id: tag
+      - name: Decide the package and the publish flag
+        id: plan
         shell: bash
         env:
+          EVENT_NAME: ${{ github.event_name }}
           EVENT_TAG: ${{ github.event.release.tag_name }}
           EVENT_PRERELEASE: ${{ github.event.release.prerelease }}
+          INPUT_PACKAGE: ${{ inputs.package }}
           INPUT_TAG: ${{ inputs.tag }}
           INPUT_PUBLISH: ${{ inputs.publish }}
         run: |
           set -euo pipefail
-          tag="${INPUT_TAG:-$EVENT_TAG}"
-          if [[ -z "$tag" ]]; then
-            echo "::error::no tag supplied"; exit 1
-          fi
-          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::tag '$tag' is not a vX.Y.Z release tag"; exit 1
-          fi
-          if [[ "$EVENT_PRERELEASE" == "true" ]]; then
-            echo "::error::'$tag' is a prerelease; the AUR package tracks releases only"; exit 1
-          fi
-          # pacman versions may not contain '-' or '+'.
-          version="${tag#v}"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          # A published release publishes automatically; a manual run must ask.
-          if [[ "$GITHUB_EVENT_NAME" == "release" || "$INPUT_PUBLISH" == "true" ]]; then
-            echo "publish=true" >> "$GITHUB_OUTPUT"
+
+          case "$EVENT_NAME" in
+            release)  package=clawd-on-desk-bin ;;
+            push)     package=clawd-on-desk-git ;;
+            *)        package="${INPUT_PACKAGE:-clawd-on-desk-git}" ;;
+          esac
+
+          if [[ "$package" == "clawd-on-desk-bin" ]]; then
+            tag="${INPUT_TAG:-$EVENT_TAG}"
+            if [[ -z "$tag" ]]; then
+              echo "::error::clawd-on-desk-bin needs a release tag"; exit 1
+            fi
+            if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::tag '$tag' is not a vX.Y.Z release tag"; exit 1
+            fi
+            if [[ "$EVENT_PRERELEASE" == "true" ]]; then
+              echo "::error::'$tag' is a prerelease; the AUR package tracks releases only"; exit 1
+            fi
+            # pacman versions may not contain '-' or '+'.
+            version="${tag#v}"
           else
-            echo "publish=false" >> "$GITHUB_OUTPUT"
+            # pkgver() derives the version from the clone, so nothing to resolve
+            # here; the build job reads it back out of the generated .SRCINFO.
+            tag=""
+            version=""
           fi
-          echo "Resolved $tag (version $version)"
+
+          # A published release and a branch push publish on their own; a manual
+          # run has to ask, because it can be started against any ref.
+          if [[ "$EVENT_NAME" == "release" || "$EVENT_NAME" == "push" || "$INPUT_PUBLISH" == "true" ]]; then
+            publish=true
+          else
+            publish=false
+          fi
+
+          {
+            echo "package=$package"
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "publish=$publish"
+          } >> "$GITHUB_OUTPUT"
+          echo "package=$package tag=${tag:-<from git describe>} publish=$publish"
 
   build:
     needs: resolve
@@ -99,11 +136,15 @@ jobs:
     # library set are what the package is built and installed against. The
     # ubuntu-latest runner only hosts the container.
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # A -git build clones 618 MiB of history, installs a 468 MB npm tree and
+    # downloads Electron before electron-builder runs. 90 minutes was tight
+    # enough that a slow GitHub-to-container fetch alone could time out.
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
 
       - name: Download the release assets and measure their checksums
+        if: needs.resolve.outputs.package == 'clawd-on-desk-bin'
         shell: bash
         env:
           TAG: ${{ needs.resolve.outputs.tag }}
@@ -131,7 +172,8 @@ jobs:
           ( cd aur-input && sha256sum "$appimage" LICENSE NOTICE.md > SHA256SUMS )
           cat aur-input/SHA256SUMS
 
-      - name: Stage the PKGBUILD for this version
+      - name: Stage the -bin PKGBUILD for this version
+        if: needs.resolve.outputs.package == 'clawd-on-desk-bin'
         shell: bash
         env:
           VERSION: ${{ needs.resolve.outputs.version }}
@@ -170,12 +212,15 @@ jobs:
 
       - name: Build and verify the package in an Arch container
         shell: bash
+        env:
+          AUR_PACKAGE: ${{ needs.resolve.outputs.package }}
         run: |
           set -euo pipefail
           # The build logic is a plain file for the same reason ci/arch-build.sh
           # is: nesting quoted bash inside a YAML block scalar is where the
           # quoting bugs come from.
           docker run --rm \
+            -e AUR_PACKAGE="$AUR_PACKAGE" \
             -v "$PWD:/work" \
             -w /work \
             archlinux:latest bash /work/packaging/aur/ci/aur-build.sh
@@ -189,7 +234,7 @@ jobs:
       # AUR hook only after the push had already started.
       - uses: actions/upload-artifact@v4
         with:
-          name: aur-package-${{ needs.resolve.outputs.version }}
+          name: aur-package
           path: |
             out/aur/*.pkg.tar.zst
             out/aur/SRCINFO
@@ -210,7 +255,7 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: aur-package-${{ needs.resolve.outputs.version }}
+          name: aur-package
           path: out/aur
 
       - name: Configure SSH for the AUR
@@ -261,9 +306,15 @@ jobs:
       - name: Push the package to the AUR
         shell: bash
         env:
-          VERSION: ${{ needs.resolve.outputs.version }}
+          AUR_PACKAGE: ${{ needs.resolve.outputs.package }}
         run: |
           set -euo pipefail
+          # The version is whatever pkgver() produced for a -git build and what
+          # the release tag said for -bin; .SRCINFO is the authority in both
+          # cases because makepkg generated it from the PKGBUILD being pushed.
+          version="$(sed -n 's/^\tpkgver = //p' out/aur/SRCINFO)"
+          test -n "$version" || { echo "::error::.SRCINFO carries no pkgver"; exit 1; }
+
           work="$RUNNER_TEMP/aur-repo"
           remote="ssh://$AUR_USER@$AUR_HOST:$AUR_PORT/$AUR_PACKAGE"
           # The package repo is created by the service on the first push of a
@@ -278,10 +329,10 @@ jobs:
           git -C "$work" config user.email "release-bot@users.noreply.github.com"
           git -C "$work" add PKGBUILD .SRCINFO
           if git -C "$work" diff --cached --quiet; then
-            echo "AUR is already at $VERSION-1; nothing to push"
+            echo "AUR is already at $version-1 for $AUR_PACKAGE; nothing to push"
             exit 0
           fi
-          git -C "$work" commit -q -m "upgpkg: $AUR_PACKAGE $VERSION-1"
+          git -C "$work" commit -q -m "upgpkg: $AUR_PACKAGE $version-1"
           # The service's hook rejects a commit whose .SRCINFO disagrees with its
           # PKGBUILD, and rejects a non-fast-forward outright. Both are reported
           # on the push itself, so its output is the final gate.

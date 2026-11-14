@@ -1,0 +1,194 @@
+# Maintainer: xingguangcuican <xingguangcuican666@foxmail.com>
+#
+# clawd-on-desk-git — builds Clawd on Desk from the native-Wayland branch.
+#
+# This tracks the branch that carries the native Wayland backend
+# (src/linux-wayland.js, src/linux-wayland-shim.js), which upstream has not
+# released yet. It builds the app from source rather than repackaging an
+# AppImage, so a user always gets the current HEAD of that branch — pkgver()
+# recomputes the version on every build.
+#
+# The package is deliberately `-git`: it follows a branch, not a tag. Users who
+# want a released, prebuilt artifact should use clawd-on-desk-bin instead; the
+# two conflict because they install the same launcher.
+#
+# Dependencies are the same set measured for the packaged app: readelf supplies
+# the linked sonames, the libraries Chromium dlopen()s are listed explicitly,
+# and pacman -F named the owning packages. Libraries that ship inside the
+# Electron bundle (libEGL, libGLESv2, libffmpeg, libvk_swiftshader) are not
+# requested from the distro.
+#
+# Building downloads ~100 MB of Electron from GitHub. If that is unreachable,
+# @electron/get honours these without any PKGBUILD change:
+#   ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ makepkg -si
+#   ELECTRON_GET_USE_PROXY=true HTTPS_PROXY=http://127.0.0.1:7890 makepkg -si
+# (the second is required for proxy use — @electron/get ignores HTTPS_PROXY
+# unless ELECTRON_GET_USE_PROXY is set.)
+
+pkgname=clawd-on-desk-git
+_pkgname=clawd-on-desk
+pkgver=1.6.0.r63.g33dfa44
+pkgrel=1
+pkgdesc='Clawd on Desk - a desktop pet that reacts to your coding sessions (native Wayland branch)'
+arch=('x86_64')
+url='https://github.com/xingguangcuican6666/clawd-on-desk'
+license=('AGPL-3.0-only')
+depends=(
+    alsa-lib
+    at-spi2-core
+    cairo
+    dbus
+    expat
+    gcc-libs
+    glib2
+    glibc
+    gtk3
+    libcups
+    libdrm
+    libnotify
+    libpulse
+    libsecret
+    libx11
+    libxcb
+    libxcomposite
+    libxdamage
+    libxext
+    libxfixes
+    libxkbcommon
+    libxrandr
+    mesa
+    nspr
+    nss
+    pango
+    systemd-libs
+    # Electron dlopen()s libvulkan.so.1 for the GPU process; mesa does not pull
+    # the loader in, so it is listed rather than left to the ICD's packaging.
+    vulkan-icd-loader
+    wayland
+    xdg-utils
+)
+makedepends=(
+    git
+    nodejs
+    npm
+)
+optdepends=(
+    'libappindicator: system tray icon'
+    # The app itself launches and animates without a system Node. The hook
+    # commands it writes into each agent's settings are `node <script>`, and
+    # when no Node can be found the installer falls back to a bare `node`, which
+    # then fails at hook time. Electron's own binary is not usable for this.
+    'nodejs: run the agent hook scripts the app installs'
+)
+provides=('clawd-on-desk')
+conflicts=('clawd-on-desk' 'clawd-on-desk-bin')
+# Electron binaries must not be stripped; !debug keeps a release build from
+# producing a debug package nobody can use.
+options=('!strip' '!debug')
+source=("git+https://github.com/xingguangcuican6666/clawd-on-desk.git#branch=feat/native-wayland-xingguangcuican6666")
+sha256sums=('SKIP')
+
+pkgver() {
+    cd "$_pkgname"
+    # v1.6.0-63-g33dfa44 -> 1.6.0.r63.g33dfa44
+    git describe --long --tags --abbrev=7 \
+        | sed 's/^v//; s/\([^-]*-g\)/r\1/; s/-/./g'
+}
+
+build() {
+    cd "$_pkgname"
+
+    # The lockfile is the source of truth, and an inherited registry or
+    # userconfig would make the package depend on the builder's npm mirror.
+    # NODE_ENV=production would make `npm ci` skip devDependencies, which is
+    # where electron-builder and electron itself come from.
+    unset npm_config_registry npm_config_userconfig npm_config_globalconfig \
+          NPM_CONFIG_REGISTRY NPM_CONFIG_USERCONFIG NPM_CONFIG_GLOBALCONFIG \
+          NODE_ENV npm_config_production npm_config_only
+
+    # npm 12 blocks dependency install scripts unless they are named. Electron's
+    # postinstall (node install.js) is what downloads the Electron binary, and
+    # koffi/protobufjs compile or unpack native code, so all four are listed.
+    # Without this the app "installs" with an empty node_modules/electron/dist
+    # and the repository's own postinstall check fails the build.
+    printf 'allow-scripts=electron,electron-winstaller,koffi,protobufjs\n' > .npmrc
+
+    # 234 entries in package-lock.json carry a tarball URL under
+    # registry.npmmirror.com rather than the configured registry, and npm 12
+    # defaults allow-remote to "none", which refuses them with EALLOWREMOTE.
+    # Every one of those entries has a sha512 integrity hash, so the lockfile
+    # still pins the exact bytes npm accepts.
+    #
+    # npm ci runs the repository's postinstall (verify-electron-install), which
+    # is also what proves the Electron download actually produced a binary.
+    npm_config_allow_remote=all npm ci
+
+    # `dir` only: the AppImage target exists to make a FUSE mount work, and its
+    # AppRun wrapper would be installed as if it were a system launcher. The
+    # binary is called through its own path directly.
+    ./node_modules/.bin/electron-builder --linux dir --x64 --publish never
+
+    test -x dist/linux-unpacked/clawd-on-desk
+    test -f dist/linux-unpacked/resources/app.asar
+}
+
+# No check(): the suite is Electron-backed and needs a display plus xvfb, which
+# is a build-environment dependency rather than something a user installing this
+# package should pay for. The upstream build job runs it on every release.
+
+package() {
+    cd "$_pkgname"
+    local appdir="$srcdir/$_pkgname/dist/linux-unpacked"
+
+    install -d "$pkgdir/opt/Clawd-on-Desk"
+    cp -a "$appdir/." "$pkgdir/opt/Clawd-on-Desk/"
+
+    # afterPack writes the AppImage lifetime guard into the pack directory for
+    # every Linux target, including `dir`. Neither file is reachable from an
+    # unpacked install: AppRun only runs inside a mounted AppDir, and the
+    # supervisor it execs exists to work around FUSE-backed backing files.
+    rm -f "$pkgdir/opt/Clawd-on-Desk/AppRun" \
+          "$pkgdir/opt/Clawd-on-Desk/clawd-appimage-launcher.sh"
+
+    # Chromium's setuid sandbox helper must stay root-owned and setuid; pacman
+    # keeps the mode, so set both explicitly.
+    chown -R root:root "$pkgdir"
+    chmod 4755 "$pkgdir/opt/Clawd-on-Desk/chrome-sandbox"
+
+    install -d "$pkgdir/usr/bin"
+    ln -s /opt/Clawd-on-Desk/clawd-on-desk "$pkgdir/usr/bin/clawd-on-desk"
+
+    # The `dir` target stages no icons, so they come straight from the source
+    # tree. A missing size is a packaging bug, not something to skip silently.
+    local icon size
+    for icon in assets/icons/*.png; do
+        size="$(basename "$icon" .png)"
+        install -Dm644 "$icon" \
+            "$pkgdir/usr/share/icons/hicolor/$size/apps/clawd-on-desk.png"
+    done
+    [[ -f "$pkgdir/usr/share/icons/hicolor/512x512/apps/clawd-on-desk.png" ]] || {
+        echo "error: assets/icons/512x512.png is missing" >&2
+        exit 1
+    }
+
+    # StartupWMClass matches the class the window actually gets (read from the
+    # compositor), so the launcher and the pet window group together.
+    install -d "$pkgdir/usr/share/applications"
+    cat > "$pkgdir/usr/share/applications/clawd-on-desk.desktop" <<'DESKTOP'
+[Desktop Entry]
+Name=Clawd on Desk
+Comment=A desktop pet that reacts to your coding sessions
+Exec=/usr/bin/clawd-on-desk %U
+Icon=clawd-on-desk
+Terminal=false
+Type=Application
+Categories=Utility;
+StartupWMClass=clawd-on-desk
+MimeType=x-scheme-handler/clawd;
+DESKTOP
+
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 NOTICE.md "$pkgdir/usr/share/licenses/$pkgname/NOTICE.md"
+}
+
+# vim:set ft=sh:
